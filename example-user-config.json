@@ -1,0 +1,16 @@
+{
+  "password": "ChangeThisSecurePassword123!",
+  "role_arn": "arn:aws:iam::123456789012:role/YourStack-SftpUserRole-ABC123",
+  "home_directory": "/example-user",
+  "allowed_ips": [
+    "192.168.1.0/24",
+    "10.0.0.1", 
+    "203.0.113.0/24"
+  ],
+  "home_directory_mappings": [
+    {
+      "Entry": "/",
+      "Target": "/your-s3-bucket-name/example-user"
+    }
+  ]
+}

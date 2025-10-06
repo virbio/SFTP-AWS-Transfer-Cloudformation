@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SFTP Server with IP whitelisting and AWS Secrets Manager authentication'
+
+Parameters:
+  ServerName:
+    Type: String
+    Default: 'sftp-server'
+    Description: 'Name for the SFTP server'
+  
+  S3BucketName:
+    Type: String
+    Description: 'S3 bucket name for SFTP user home directories'
+    Default: 'sftp-user-data-bucket'
+
+Resources:
+  # S3 Bucket for SFTP user data
+  SftpS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # IAM Role for SFTP Server
+  SftpServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSTransferLoggingAccess
+
+  # IAM Role for Lambda Authentication Function
+  LambdaAuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:sftp/*'
+
+  # IAM Role for SFTP Users
+  SftpUserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SftpS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !GetAtt SftpS3Bucket.Arn
+                Condition:
+                  StringLike:
+                    's3:prefix': '${transfer:UserName}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObjectVersion
+                  - s3:DeleteObjectVersion
+                Resource: !Sub '${SftpS3Bucket.Arn}/${!transfer:UserName}/*'
+
+  # Lambda function for custom authentication
+  SftpAuthFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ServerName}-auth-function'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaAuthRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from ipaddress import ip_address, ip_network
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  # Extract parameters from the event
+                  username = event.get('username', '')
+                  password = event.get('password', '')
+                  protocol = event.get('protocol', '')
+                  serverId = event.get('serverId', '')
+                  sourceIp = event.get('sourceIp', '')
+                  
+                  logger.info(f"Authentication attempt for user: {username}, from IP: {sourceIp}")
+                  
+                  # Get user credentials and configuration from Secrets Manager
+                  secrets_client = boto3.client('secretsmanager')
+                  
+                  try:
+                      secret_name = f"sftp/{username}"
+                      secret_response = secrets_client.get_secret_value(SecretId=secret_name)
+                      secret_data = json.loads(secret_response['SecretString'])
+                  except Exception as e:
+                      logger.error(f"Failed to retrieve secret for user {username}: {str(e)}")
+                      return {}
+                  
+                  # Verify password
+                  if secret_data.get('password') != password:
+                      logger.error(f"Invalid password for user {username}")
+                      return {}
+                  
+                  # Check IP whitelist
+                  allowed_ips = secret_data.get('allowed_ips', [])
+                  if allowed_ips and not is_ip_allowed(sourceIp, allowed_ips):
+                      logger.error(f"IP {sourceIp} not allowed for user {username}")
+                      return {}
+                  
+                  # Return successful authentication response
+                  response = {
+                      "Role": secret_data.get('role_arn', ''),
+                      "Policy": secret_data.get('policy', ''),
+                      "HomeDirectory": secret_data.get('home_directory', f"/{username}"),
+                      "HomeDirectoryType": "LOGICAL"
+                  }
+                  
+                  # Add HomeDirectoryMappings if specified
+                  if 'home_directory_mappings' in secret_data:
+                      response["HomeDirectoryMappings"] = secret_data['home_directory_mappings']
+                  
+                  logger.info(f"Successful authentication for user: {username}")
+                  return response
+                  
+              except Exception as e:
+                  logger.error(f"Authentication error: {str(e)}")
+                  return {}
+
+          def is_ip_allowed(source_ip, allowed_ips):
+              """Check if source IP is in the allowed list (supports both IP addresses and CIDR ranges)"""
+              try:
+                  source = ip_address(source_ip)
+                  for allowed in allowed_ips:
+                      try:
+                          # Try as CIDR range first
+                          if '/' in allowed:
+                              if source in ip_network(allowed, strict=False):
+                                  return True
+                          # Try as single IP address
+                          else:
+                              if source == ip_address(allowed):
+                                  return True
+                      except ValueError:
+                          continue
+                  return False
+              except ValueError:
+                  return False
+
+  # SFTP Server
+  SftpServer:
+    Type: AWS::Transfer::Server
+    Properties:
+      Domain: S3
+      EndpointType: PUBLIC
+      IdentityProviderType: AWS_LAMBDA
+      IdentityProviderDetails:
+        Function: !GetAtt SftpAuthFunction.Arn
+      Protocols:
+        - SFTP
+      SecurityPolicyName: TransferSecurityPolicy-2020-06
+      LoggingRole: !GetAtt SftpServerRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Ref ServerName
+
+  # Permission for Transfer service to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SftpAuthFunction
+      Action: lambda:InvokeFunction
+      Principal: transfer.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # Example Secret for a user (you can create more secrets following this pattern)
+  ExampleUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'sftp/example-user'
+      Description: 'SFTP user credentials and configuration'
+      SecretString: !Sub |
+        {
+          "password": "ChangeThisPassword123!",
+          "role_arn": "${SftpUserRole.Arn}",
+          "home_directory": "/example-user",
+          "allowed_ips": ["192.168.1.0/24", "10.0.0.1", "203.0.113.0/24"],
+          "home_directory_mappings": [
+            {
+              "Entry": "/",
+              "Target": "/${S3BucketName}/example-user"
+            }
+          ]
+        }
+
+  # CloudWatch Log Group for SFTP Server
+  SftpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/transfer/${ServerName}'
+      RetentionInDays: 14
+
+Outputs:
+  SftpServerId:
+    Description: 'SFTP Server ID'
+    Value: !GetAtt SftpServer.ServerId
+    Export:
+      Name: !Sub '${AWS::StackName}-SftpServerId'
+
+  SftpServerEndpoint:
+    Description: 'SFTP Server Endpoint'
+    Value: !Sub '${SftpServer.ServerId}.server.transfer.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-SftpServerEndpoint'
+
+  S3BucketName:
+    Description: 'S3 Bucket for SFTP user data'
+    Value: !Ref SftpS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  LambdaAuthFunctionArn:
+    Description: 'Lambda Authentication Function ARN'
+    Value: !GetAtt SftpAuthFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaAuthFunctionArn'
+
+  ExampleUserSecretArn:
+    Description: 'Example User Secret ARN'
+    Value: !Ref ExampleUserSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-ExampleUserSecretArn'
