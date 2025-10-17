@@ -168,6 +168,12 @@ Resources:
                       secret_name = f"{serverId}/{username}"
                       secret_response = secrets_client.get_secret_value(SecretId=secret_name)
                       secret_data = json.loads(secret_response['SecretString'])
+                  except secrets_client.exceptions.ResourceNotFoundException:
+                      logger.error(f"Secret not found for user {username}")
+                      return {}
+                  except json.JSONDecodeError as e:
+                      logger.error(f"Invalid JSON in secret for user {username}: {str(e)}")
+                      return {}
                   except Exception as e:
                       logger.error(f"Failed to retrieve secret for user {username}: {str(e)}")
                       return {}
