@@ -11,6 +11,24 @@ Parameters:
     Type: String
     Description: 'S3 bucket name for SFTP user home directories'
     Default: 'sftp-user-data-bucket'
+  
+  EndpointType:
+    Type: String
+    Default: 'PUBLIC'
+    AllowedValues:
+      - PUBLIC
+      - VPC
+    Description: 'Endpoint type: PUBLIC (internet) or VPC (static IP)'
+  
+  VpcId:
+    Type: String
+    Default: ''
+    Description: 'VPC ID (required if EndpointType is VPC)'
+  
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: 'Comma-separated subnet IDs (required if EndpointType is VPC)'
 
 Resources:
   # S3 Bucket for SFTP user data
@@ -65,7 +83,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:sftp/*'
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
 
   # IAM Role for SFTP Users
   SftpUserRole:
@@ -134,7 +152,7 @@ Resources:
                   secrets_client = boto3.client('secretsmanager')
                   
                   try:
-                      secret_name = f"sftp/{username}"
+                      secret_name = f"{serverId}/{username}"
                       secret_response = secrets_client.get_secret_value(SecretId=secret_name)
                       secret_data = json.loads(secret_response['SecretString'])
                   except Exception as e:
@@ -142,27 +160,26 @@ Resources:
                       return {}
                   
                   # Verify password
-                  if secret_data.get('password') != password:
+                  if secret_data.get('Password') != password:
                       logger.error(f"Invalid password for user {username}")
                       return {}
                   
                   # Check IP whitelist
-                  allowed_ips = secret_data.get('allowed_ips', [])
+                  allowed_ips = secret_data.get('SourceIps', [])
                   if allowed_ips and not is_ip_allowed(sourceIp, allowed_ips):
                       logger.error(f"IP {sourceIp} not allowed for user {username}")
                       return {}
                   
                   # Return successful authentication response
                   response = {
-                      "Role": secret_data.get('role_arn', ''),
-                      "Policy": secret_data.get('policy', ''),
-                      "HomeDirectory": secret_data.get('home_directory', f"/{username}"),
+                      "Role": secret_data.get('Role', ''),
+                      "Policy": secret_data.get('Policy', ''),
                       "HomeDirectoryType": "LOGICAL"
                   }
                   
                   # Add HomeDirectoryMappings if specified
-                  if 'home_directory_mappings' in secret_data:
-                      response["HomeDirectoryMappings"] = secret_data['home_directory_mappings']
+                  if 'HomeDirectory Details' in secret_data:
+                      response["HomeDirectoryMappings"] = secret_data['HomeDirectory Details']
                   
                   logger.info(f"Successful authentication for user: {username}")
                   return response
@@ -191,12 +208,47 @@ Resources:
               except ValueError:
                   return False
 
+  # Security Group for VPC endpoint
+  SftpSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsVpcEndpoint
+    Properties:
+      GroupDescription: SFTP Server Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServerName}-sg'
+
+  # Elastic IP for static address
+  SftpEIP:
+    Type: AWS::EC2::EIP
+    Condition: IsVpcEndpoint
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServerName}-eip'
+
   # SFTP Server
   SftpServer:
     Type: AWS::Transfer::Server
     Properties:
       Domain: S3
-      EndpointType: PUBLIC
+      EndpointType: !Ref EndpointType
+      EndpointDetails: !If
+        - IsVpcEndpoint
+        - VpcId: !Ref VpcId
+          SubnetIds: !Ref SubnetIds
+          SecurityGroupIds:
+            - !Ref SftpSecurityGroup
+          AddressAllocationIds:
+            - !GetAtt SftpEIP.AllocationId
+        - !Ref AWS::NoValue
       IdentityProviderType: AWS_LAMBDA
       IdentityProviderDetails:
         Function: !GetAtt SftpAuthFunction.Arn
@@ -220,16 +272,16 @@ Resources:
   # Example Secret for a user (you can create more secrets following this pattern)
   ExampleUserSecret:
     Type: AWS::SecretsManager::Secret
+    DependsOn: SftpServer
     Properties:
-      Name: !Sub 'sftp/example-user'
+      Name: !Sub '${SftpServer.ServerId}/example-user'
       Description: 'SFTP user credentials and configuration'
       SecretString: !Sub |
         {
-          "password": "ChangeThisPassword123!",
-          "role_arn": "${SftpUserRole.Arn}",
-          "home_directory": "/example-user",
-          "allowed_ips": ["192.168.1.0/24", "10.0.0.1", "203.0.113.0/24"],
-          "home_directory_mappings": [
+          "Password": "ChangeThisPassword123!",
+          "Role": "${SftpUserRole.Arn}",
+          "SourceIps": ["192.168.1.0/24", "10.0.0.1", "203.0.113.0/24"],
+          "HomeDirectory Details": [
             {
               "Entry": "/",
               "Target": "/${S3BucketName}/example-user"
@@ -243,6 +295,9 @@ Resources:
     Properties:
       LogGroupName: !Sub '/aws/transfer/${ServerName}'
       RetentionInDays: 14
+
+Conditions:
+  IsVpcEndpoint: !Equals [!Ref EndpointType, 'VPC']
 
 Outputs:
   SftpServerId:
@@ -274,3 +329,9 @@ Outputs:
     Value: !Ref ExampleUserSecret
     Export:
       Name: !Sub '${AWS::StackName}-ExampleUserSecretArn'
+  
+  ElasticIP:
+    Description: 'Elastic IP for SFTP (VPC mode only)'
+    Value: !If [IsVpcEndpoint, !Ref SftpEIP, 'N/A - PUBLIC endpoint']
+    Export:
+      Name: !Sub '${AWS::StackName}-ElasticIP'
