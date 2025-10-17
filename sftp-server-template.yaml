@@ -47,6 +47,15 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: OptimizeAndDelete
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                Days: 30
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
 
   # IAM Role for SFTP Server
   SftpServerRole:
@@ -313,7 +322,7 @@ Outputs:
       Name: !Sub '${AWS::StackName}-SftpServerEndpoint'
 
   S3BucketName:
-    Description: 'S3 Bucket for SFTP user data'
+    Description: 'S3 Bucket for SFTP user data (90-day retention with intelligent tiering)'
     Value: !Ref SftpS3Bucket
     Export:
       Name: !Sub '${AWS::StackName}-S3BucketName'
