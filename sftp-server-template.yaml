@@ -228,6 +228,8 @@ Resources:
                   return False
 
   # Security Group for VPC endpoint
+  # Note: Network-level access is open (0.0.0.0/0) because IP whitelisting
+  # is enforced at the application layer by the Lambda authentication function
   SftpSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Condition: IsVpcEndpoint
@@ -238,7 +240,7 @@ Resources:
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
-          CidrIp: 0.0.0.0/0
+          CidrIp: 0.0.0.0/0  # Open to all - IP filtering done by Lambda
       Tags:
         - Key: Name
           Value: !Sub '${ServerName}-sg'
@@ -251,7 +253,7 @@ Resources:
       Domain: vpc
       Tags:
         - Key: Name
-          Value: !Sub '${ServerName}-eip'
+          Value: !Sub '${ServerName}-eip'   Value: !Sub '${ServerName}-eip'
 
   # SFTP Server
   SftpServer:
