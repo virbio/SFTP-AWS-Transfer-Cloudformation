@@ -125,7 +125,9 @@ Resources:
                   - s3:DeleteObject
                   - s3:GetObjectVersion
                   - s3:DeleteObjectVersion
-                Resource: !Sub '${SftpS3Bucket.Arn}/${!transfer:UserName}/*'
+                Resource: !Sub
+                  - '${BucketArn}/${!transfer:UserName}/*'
+                  - BucketArn: !GetAtt SftpS3Bucket.Arn
 
   # Lambda function for custom authentication
   SftpAuthFunction:
@@ -145,6 +147,9 @@ Resources:
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
+          
+          # Initialize Secrets Manager client outside handler for reuse across invocations
+          secrets_client = boto3.client('secretsmanager')
 
           def lambda_handler(event, context):
               try:
@@ -158,7 +163,6 @@ Resources:
                   logger.info(f"Authentication attempt for user: {username}, from IP: {sourceIp}")
                   
                   # Get user credentials and configuration from Secrets Manager
-                  secrets_client = boto3.client('secretsmanager')
                   
                   try:
                       secret_name = f"{serverId}/{username}"
